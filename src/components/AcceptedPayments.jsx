@@ -1,79 +1,150 @@
-import React from "react";
-import {
-  Smartphone,
-  Building2,
-  Wallet,
-  Banknote,
-  CreditCard,
-} from "lucide-react";
+const express = require('express');
+const mongoose = require('mongoose');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const { User, Item } = require('./models');
 
-const METHODS = [
-  {
-    name: "Tele Birr",
-    icon: Smartphone,
-    detail: "Mobile wallet",
-  },
-  {
-    name: "CBE Bank",
-    icon: Building2,
-    detail: "Commercial Bank of Ethiopia",
-  },
-  {
-    name: "M_PESA",
-    icon: Wallet,
-    detail: "Mobile banking",
-  },
-  {
-    name: "Other banks",
-    icon: CreditCard,
-    detail: "Awash, Dashen, Abyssinia",
-  },
-  {
-    name: "Cash on delivery",
-    icon: Banknote,
-    detail: "Pay when you receive",
-  },
-];
+const app = express();
+app.use(express.json());
 
-export default function AcceptedPayments() {
-  return (
-    <div className="rounded-2xl border bg-card p-5 shadow-sm">
-      <div>
-        <h3 className="text-base font-semibold">
-          Accepted payment methods
-        </h3>
+const JWT_SECRET = process.env.JWT_SECRET || 'campus_market_secret_key';
+const PORT = process.env.PORT || 5000;
 
-        <p className="mt-1 text-sm text-muted-foreground">
-          Pay your orders the way that's easiest for you.
-        </p>
-      </div>
+// Connect to MongoDB
+mongoose.connect('mongodb://localhost:27017/campus_market')
+  .then(() => console.log('Connected to MongoDB'))
+  .catch(err => console.error('MongoDB connection error:', err));
 
-      <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-        {METHODS.map((m) => {
-          const Icon = m.icon;
+// --- Auth Middleware ---
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Expects: "Bearer TOKEN"
 
-          return (
-            <div
-              key={m.name}
-              className="group flex items-center gap-3 rounded-xl border bg-background px-4 py-3 transition-all duration-200 hover:-translate-y-0.5 hover:border-emerald-500/50 hover:shadow-sm"
-            >
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-emerald-50 transition-colors group-hover:bg-emerald-100">
-                <Icon className="h-5 w-5 text-emerald-600" />
-              </div>
+  if (!token) return res.status(401).json({ message: 'Access denied: No token provided' });
 
-              <div className="min-w-0">
-                <div className="text-sm font-medium leading-tight">
-                  {m.name}
-                </div>
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ message: 'Invalid or expired token' });
+    req.user = user; // Contains { id, email }
+    next();
+  });
+};
 
-                <div className="mt-1 text-[11px] leading-tight text-muted-foreground">
-                  {m.detail}
-                </div>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
+// ==================== AUTH ROUTES ====================
+
+// Register User
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { name, email, password, campusLocation } = req.body;
+
+    const existingUser = await User.findOne({ email });
+    if (existingUser) return res.status(400).json({ message: 'User already exists' });
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const user = new User({ name, email, password: hashedPassword, campusLocation });
+    await user.save();
+
+    res.status(201).json({ message: 'User registered successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Login User
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await User.findOne({ email });
+
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+      return res.status(400).json({ message: 'Invalid credentials' });
+    }
+
+    const token = jwt.sign({ id: user._id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: user._id, name: user.name, email: user.email } });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==================== MARKETPLACE ROUTES ====================
+
+// Get All Available Items (Search & Filter)
+app.get('/api/items', async (req, res) => {
+  try {
+    const { search, category, maxPrice } = req.query;
+    let query = { status: 'Available' };
+
+    if (search) {
+      query.title = { $regex: search,$options: 'i' };
+    }
+    if (category) {
+      query.category = category;
+    }
+    if (maxPrice) {
+      query.price = { $lte: Number(maxPrice) };
+    }
+
+    const items = await Item.find(query).populate('seller', 'name campusLocation email');
+    res.json(items);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Create New Item Listing (Protected)
+app.post('/api/items', authenticateToken, async (req, res) => {
+  try {
+    const { title, description, price, category, condition } = req.body;
+
+    const newItem = new Item({
+      title,
+      description,
+      price,
+      category,
+      condition,
+      seller: req.user.id
+    });
+
+    await newItem.save();
+    res.status(201).json(newItem);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Update Item Status / Details (Protected)
+app.put('/api/items/:id', authenticateToken, async (req, res) => {
+  try {
+    const item = await Item.findById(req.params.id);
+    if (!item) return res.status(404).json({ message: 'Item not found' });
+
+    if (item.seller.toString() !== req.user.id) {
+      return res.status(403).json({ message: 'Not authorized to edit this listing' });
+    }
+
+    Object.assign(item, req.body);
+    await item.save();
+    res.json(item);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete Item Listing (Protected)
+app.delete('/api/items/:id', authenticateToken, async (req, res) => {
+  try {
+    const item = await Item.findById(req.params.id);
+    if (!item) return res.status(404).json({ message: 'Item not found' });
+
+    if (item.seller.toString() !== req.user.id) {
+      return res.status(403).json({ message: 'Not authorized to delete this listing' });
+    }
+
+    await item.deleteOne();
+    res.json({ message: 'Listing removed successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.listen(PORT, () => console.log(`Campus Market API running on port ${PORT}`));
